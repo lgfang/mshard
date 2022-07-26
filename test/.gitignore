@@ -1,0 +1,4 @@
+# By default, ignore everything (config dumps) in this directory
+*
+# Except this file
+!.gitignore

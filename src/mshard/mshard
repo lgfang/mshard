@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+
+import argparse, logging, sys, re
+import datetime, uuid, json, bson, bson.json_util
+import traceback
+import pymongo
+from json2html import *
+
+from version import __version__, __myprogram__
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+
+    # common options
+    parser.add_argument('-V', '--version', action='store_true',
+                        help=f'Display the version number of {__myprogram__} and exit.')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Verbose mode. Print debug information')
+    parser.add_argument('-u', '--uri',
+                        help='Mongo Connection String to the sharding config database.',
+                        default='localhost:27017')
+    parser.add_argument('-d', '--database',
+                        help='Name of the config database',
+                        default='config')
+
+    # Sub-commands
+    sub_parsers = parser.add_subparsers(title='subcommands', dest='command',
+        help=f'Run "{__myprogram__} subcommand -h" to print help for the subcommand')
+
+    sub_parser = sub_parsers.add_parser('status', help='An overview of the sharded cluster')
+    sub_parser.set_defaults(func=status)
+    sub_parser.add_argument('section', nargs='?',
+                            choices=['coverage', 'version', 'shards', 'collections','mongos',
+                                     'autosplit', 'balancer'])
+
+    sub_parser = sub_parsers.add_parser('splits', help='Information about splits')
+    sub_parser.set_defaults(func=splits)
+
+    sub_parser = sub_parsers.add_parser('chunks', help='Details of chunks')
+    sub_parser.set_defaults(func=chunks)
+    sub_parser.add_argument('section', nargs='?',
+                            choices=['total', 'shards', 'collections', 'jumbos', 'imbalances'])
+
+    args = parser.parse_args()
+
+    if args.command is None and args.version is False:
+        parser.error(f'Must enter a subcommand, run "{__myprogram__} -h" for more help')
+
+    return args
+
+def init_logging(verbose):
+    formatter = logging.Formatter(
+        fmt='%(asctime)s %(levelname)s %(name)s: %(message)s',
+        datefmt="%Y-%m-%dT%H:%M:%S%z")
+
+    stderr = logging.StreamHandler(stream=sys.stderr)
+    stderr.setFormatter(formatter)
+    stderr.setLevel(logging.DEBUG if verbose is True else logging.WARN)
+
+    logging.getLogger().addHandler(stderr)
+    logging.getLogger().setLevel(logging.NOTSET)
+
+class MShardException(Exception):
+    """
+    Exceptions thrown by mshard
+    """
+
+def getConfigDB(uri, dbname):
+    mongoClient = pymongo.MongoClient(uri, uuidRepresentation="standard")
+
+    if dbname not in mongoClient.list_database_names():
+        raise MShardException('Could not find DB "%s" at "%s"' % (dbname, uri))
+
+    # if none fo the following collections exists, not a config dump.
+    signature_collections = ['mongos', 'changelog', 'actionlog']
+    existing_collections = mongoClient[dbname].list_collection_names()
+    if not set(signature_collections) & set(existing_collections):
+        raise MShardException(
+            f'Invalid config DB "{dbname}": could not find any of these collections {signature_collections}')
+
+    return mongoClient[dbname]
+
+def main():
+
+    args = parse_arguments()
+
+    if args.version is True:
+        print(f'''{__myprogram__}: {__version__}\nPymongo: {pymongo.version}\nPython: {sys.version}''')
+        sys.exit(0)
+
+    init_logging(args.verbose)
+
+    try:
+        logging.debug('args: %s', args)
+        result = args.func(args)
+        print(json2html.convert(json=bson.json_util.dumps(result, indent=2)))
+        
+    except (pymongo.errors.PyMongoError, MShardException) as e:
+        logging.error(e)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logging("keyboard interrupt received")
+    except Exception as e:
+        traceback.print_exc()
+        logging.error('Unexpected error, please contact author.')
+
+def status(args):
+    # For simplicity, get all metrics/infomation, print requested only. If this
+    # turns out to be too inefficient, refactor to only retrieve what is
+    # requested
+
+    db = getConfigDB(args.uri, args.database)
+
+    settings = {}
+    for doc in db['settings'].find():
+        key = doc['_id']
+        del doc['_id']
+        settings[key] = doc
+
+    logging.debug(f'sharding settings: {settings}')
+
+    # pipe line for active mongos
+    mongos_active_threshold_ms = 60000
+    last_ping = db['mongos'].find().sort([('ping', pymongo.DESCENDING)]).limit(1)[0]['ping']
+    active_window = last_ping - datetime.timedelta(milliseconds=mongos_active_threshold_ms)
+    agg_active_mongos = [
+        { '$match': {'ping': {'$gte': active_window}}},
+        { '$group': {'_id': '$mongoVersion', 'count': { '$sum': 1 }}},
+        { '$sort': {'version': pymongo.ASCENDING}},
+        { '$project': {'_id': 0, 'version': '$_id', 'count': 1}}
+    ]
+
+    activeMongos = {}
+    for each in db['mongos'].aggregate(agg_active_mongos):
+        activeMongos[each['version']] = each['count']
+
+    # pipe line for failed balancer rounds in last 5 attempts
+    agg_failed_balancer_rounds = [
+        { '$match': {'what': 'balancer.round'}},
+        { '$sort': {'time': pymongo.DESCENDING}},
+        { '$limit': 5},
+        { '$match': {'details.errorOccured': True }},
+        { '$project': {'_id': 0, 'time': '$time', 'errmsg': '$details.errmsg'}}
+    ]
+
+    failed_attempts = list(db['actionlog'].aggregate(agg_failed_balancer_rounds))
+    for each in failed_attempts:
+        each['time'] = each['time'].astimezone().strftime('%Y-%m-%dT%H:%M:%S.%f%z')
+
+    balancer = settings.get('balancer', {})
+    balancer['enabled'] = not balancer.get('stopped', False)
+    balancer['running'] = 'unknown' # TODO: approach to get this state?
+    balancer['failed attempts in last 5 rounds '] = {
+            'count': len(failed_attempts),
+            'attempts' : failed_attempts
+    },
+
+    collections = {}
+    for each in db['collections'].find():
+        if each.get('dropped', False) is True:
+            continue
+
+        collections[each['_id']] = {
+            'shardKey': each['key'],
+            'unique': each['unique'],
+             'balancing': not each.get('noBalance', False)
+        }
+
+    coverage = {}
+    for (col, field) in [ ('changelog', 'time'), ('actionlog', 'time')]:
+        try:
+            start = db[col].find().sort(field, pymongo.ASCENDING).limit(1)[0]
+            end = db[col].find().sort(field, pymongo.DESCENDING).limit(1)[0]
+            coverage[col]= {
+                'start': start[field],
+                'end': end[field],
+                'duration': str(end[field] - start[field])
+            }
+        except IndexError: # either no such collection or collection is empty
+            pass
+
+    result = {
+        'version': db['version'].find_one(),
+        'shards': db['shards'].find({}, {'_id':1, 'host':1, 'state':1, 'tags':1, 'draining':1}),
+        'collections' : {
+            'total number': db['collections'].count_documents({'dropped': {'$ne': True}}),
+            'list': collections,
+        },
+        'mongos': activeMongos,
+        'autosplit': settings.get('autosplit', {'enabled':True}),
+        'balancer': balancer,
+        'coverage': coverage
+    }
+
+    assert args.section is None or args.section in result, 'section name and result key mismatch'
+
+    return result if args.section is None else result[args.section]
+
+def splits(args):
+    db = getConfigDB(args.uri, args.database)
+
+    split_window = 24
+    agg_splits = [
+        {'$match': {
+            'what': re.compile('split'),
+            'details.number' : {'$ne' : 1},
+            'time': { '$gte': getTimeOfConfigDump(db) - datetime.timedelta(seconds=split_window*60*60)}}},
+
+        {'$project': {'time': 1, 'ns': 1, 'shard': {'$ifNull': ['$details.owningShard', ''] }} },
+
+        {'$group': {
+            '_id': {
+                'time': {'$dateToString': {'date': '$time', 'format': '%Y-%m-%dT%H:00:00Z'}},
+                'ns': '$ns',
+                'shard': '$shard',
+            },
+            'chunks_split': {'$sum': 1}}},
+
+        {'$sort': {'_id.time': pymongo.DESCENDING, '_id.ns': pymongo.ASCENDING, '_id.shard': pymongo.ASCENDING}},
+
+        {'$group': {
+            '_id': {'time': '$_id.time',},
+            'collection breakdown': {
+                '$push': {'ns': '$_id.ns', 'shard': '$_id.shard', 'chunks_split': '$chunks_split' }},
+            'total splits': { '$sum': '$chunks_split' } },
+        },
+
+        {'$sort': {'_id.time': pymongo.DESCENDING}},
+
+        {'$project': {'_id': 0, 'time': '$_id.time', 'total splits':1, 'collection breakdown': 1}}
+    ]
+
+    result = {
+        ('splits within %s hours' % split_window): db['changelog'].aggregate(agg_splits)
+    }
+
+    return result
+
+def chunks(args):
+
+    db = getConfigDB(args.uri, args.database)
+
+    agg_chunk_distribution = [
+        {'$group': {'_id': {'shard': '$shard'}, 'chunks': { '$sum': 1}}},
+        {'$project': {'_id': 0, 'shard': '$_id.shard', 'chunks': 1}},
+        {'$sort': {'chunks': pymongo.DESCENDING}}
+    ]
+
+    n_col_to_List = 5
+    agg_largest_collections = [
+        {'$group': {'_id': '$uuid', 'chunks': {'$sum': 1 }}},
+        {'$sort': {'chunks':pymongo.DESCENDING}},
+        {'$limit': n_col_to_List}
+    ]
+
+    def getCollectionName(doc):
+        "Queries database for each doc. Inefficicent but easier."
+        assert type(doc['_id']) == uuid.UUID, "getCollectionName: _id is not UUID"
+        return db['collections'].find_one({'uuid': doc['_id']})['_id']
+
+    largest_collections = list(db['chunks'].aggregate(agg_largest_collections))
+    for each in largest_collections:
+        each['_id'] = getCollectionName(each)
+
+    jumbo_chunks = {}
+    for each in db['chunks'].aggregate([
+            {'$match': {'jumbo': True}},
+            {'$group': {'_id': {'uuid': '$uuid', 'shard': '$shard'}, 'jumbo': {'$sum': 1}}},
+            {'$project': {'_id': '$_id.uuid', 'shard': '$_id.shard', 'jumbo': 1}}
+    ]):
+        jumbo_chunks.setdefault(getCollectionName(each), {}) # ensure the dict exists
+        jumbo_chunks[getCollectionName(each)][each['shard']] = each['jumbo']
+
+    result = {
+        'total': db['chunks'].estimated_document_count(),
+        'shards': db['chunks'].aggregate(agg_chunk_distribution),
+        'largest_collections': largest_collections,
+        'jumbos': jumbo_chunks,
+        'imbalances': ''
+    }
+
+    assert args.section is None or args.section in result, 'section name and result key mismatch'
+    return result if args.section is None else result[args.section]
+
+def getTimeOfConfigDump(db):
+    # Assume the cluster has correct time, so there are no records before/around the unix epoch.
+    configDumpTime = datetime.datetime.fromtimestamp(0)
+
+    for (col, field) in [ ('changelog', 'time'), ('actionlog', 'time'), ('mongos', 'ping')]:
+        try:
+            configDumpTime = max(configDumpTime,
+                                 db[col].find({}).sort([(field, pymongo.DESCENDING)]).limit(1)[0][field])
+        except IndexError: # either no such collection or collection is empty
+            pass
+
+    return configDumpTime
+
+if __name__ == '__main__':
+    main()
